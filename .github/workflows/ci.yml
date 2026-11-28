@@ -1,0 +1,57 @@
+name: CI
+
+# Runs the same checks as the Definition of done in AGENTS.md, on every push.
+# Browser E2E (pnpm test:e2e) is intentionally not run here: it needs Chrome and
+# the local fixture stack. Run it locally with pnpm test:e2e:secure.
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      CI: "true"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # pnpm version comes from "packageManager" in package.json.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      # Unit tests start a temporary MongoDB (mongodb-memory-server, downloaded
+      # on first run) and use dummy providers. No real credentials are used.
+      - name: Test
+        run: pnpm test
+
+      # Runs without secrets. Missing MONGODB_URI warnings during static page
+      # generation are expected and do not fail the build.
+      - name: Build
+        run: pnpm build
