@@ -12,7 +12,7 @@ import { finalizeGeneration, recopyPlatformOutputs } from "./finalize"
  * The reconciler (Vercel Cron every minute; an in-process loop in dev):
  *   • pending_submit older than 2 min with no request id → the submit never
  *     confirmed: mark failed and refund (a late webhook still attaches results);
- *   • queued / in_progress with no update for 3 min → finalize (poll status);
+ *   • Sume jobs are polled at the next cron run; other stale jobs after 3 min;
  *   • in flight past RUN_TIMEOUT_MINUTES → cancel if queued, fail + refund;
  *   • terminal failures with credits outstanding → refund (crash recovery);
  *   • outputs still on the platform CDN → retry the copy;
@@ -35,6 +35,7 @@ export async function reconcile(
 ): Promise<ReconcileSummary> {
   const now = options.now ?? new Date()
   const staleMs = (options.staleSeconds ?? 180) * 1000
+  const sumeStaleMs = (options.staleSeconds ?? 5) * 1000
   const pendingMs = (options.pendingSeconds ?? 120) * 1000
   const timeoutMs = env().RUN_TIMEOUT_MINUTES * 60_000
   const { generations } = await collections()
@@ -70,6 +71,7 @@ export async function reconcile(
     .toArray()
   for (const gen of unconfirmed)
     await guard(async () => {
+      if (gen.provider === "muapi" || gen.provider === "sume") return
       const result = await generations.updateOne(
         {
           _id: gen._id,
@@ -93,7 +95,7 @@ export async function reconcile(
       }
     })
 
-  // 2. Timeouts: runs that never finish must not hold credits forever.
+  // MuAPI has no verified cancellation contract, so only confirmed terminal states release its credits.
   const expired = await generations
     .find({
       status: { $in: ["queued", "in_progress"] },
@@ -105,6 +107,7 @@ export async function reconcile(
     await guard(async () => {
       // One last look: it may have finished without a webhook.
       if ((await finalizeGeneration(gen._id)) !== "in_flight") return
+      if (gen.provider === "muapi" || gen.provider === "sume") return
       if (gen.status === "queued" && gen.hfRequestId)
         await higgsfield()
           .cancel(gen.hfRequestId)
@@ -133,7 +136,16 @@ export async function reconcile(
     .find({
       status: { $in: [...IN_FLIGHT] },
       hfRequestId: { $exists: true },
-      updatedAt: { $lt: new Date(now.getTime() - staleMs) },
+      $or: [
+        {
+          provider: "sume",
+          updatedAt: { $lt: new Date(now.getTime() - sumeStaleMs) },
+        },
+        {
+          provider: { $ne: "sume" },
+          updatedAt: { $lt: new Date(now.getTime() - staleMs) },
+        },
+      ],
     })
     .sort({ updatedAt: 1 })
     .limit(BATCH)
@@ -158,7 +170,7 @@ export async function reconcile(
       if (refunded) summary.refunds++
     })
 
-  // 5. Outputs we couldn't copy yet (platform keeps them ≥ 7 days).
+  // 5. Retry recent provider outputs that could not be copied.
   const onPlatform = await generations
     .find({
       status: "completed",
